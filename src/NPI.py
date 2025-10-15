@@ -546,7 +546,7 @@ def model_time_series(model: nn.Module, initial_state, tlen:int, noise_strength:
         noise_strength: noise magnitude
 
     Returns:
-        FC: (N, N) correlation matrix of simulated series
+        modeled time series
     """
 
     S=initial_state.shape[0]
@@ -556,7 +556,7 @@ def model_time_series(model: nn.Module, initial_state, tlen:int, noise_strength:
 
     # Generate tlen predicted steps
     for _ in range(tlen):
-        noise = noise_strength * np.random.randn(S * N)  # (S*N,)
+        noise = 0#noise_strength * np.random.randn(S * N)  # (S*N,)
         model_input = np.array(NN_sim[-S:]).flatten() + noise  # (S*N,)
 
         if isinstance(model, ANN_RNN):
@@ -567,6 +567,40 @@ def model_time_series(model: nn.Module, initial_state, tlen:int, noise_strength:
         NN_sim.append(out)
 
     return np.array(NN_sim)  # shape ~ (S + tlen, N)
+
+
+def model_Jacobian_timewise(model: nn.Module, input_X: np.ndarray, steps: int) -> np.ndarray:
+    """
+    Compute the Jacobian for each input window separately.
+
+    Args:
+        model: trained surrogate model
+        input_X: (M, S*N) input windows (each row is one time step)
+        steps: S (window length)
+
+    Returns:
+        jacobians: (M, N, N) Jacobian slice per time step
+                   where jacobians[m] = d y / d x_laststep  at window m
+    """
+    node_num = int(input_X.shape[1] / steps)  # N
+    M = input_X.shape[0]
+    jacobians = np.zeros((M, node_num, node_num), dtype=float)
+
+    model.train()  # gradients needed
+    for i in range(M):
+        x_i = torch.tensor(input_X[i], dtype=torch.float, device=device)
+
+        if isinstance(model, ANN_RNN):
+            J = torch.autograd.functional.jacobian(model, x_i).cpu().detach().numpy()
+            jacobians[i] = J[0, :, -node_num:]  # output→last-step input
+        else:
+            J = torch.autograd.functional.jacobian(model, x_i).cpu().detach().numpy()  # (N, S*N)
+            jacobians[i] = J[:, -node_num:]
+
+    model.eval()
+    # Optionally transpose each Jacobian if you follow EC convention
+    return jacobians.transpose(0, 2, 1)  # shape (M, N, N)
+
 
 
 def model_ECt(model: nn.Module, input_X: np.ndarray, target_Y: np.ndarray, pert_strength: float) -> np.ndarray:
@@ -614,108 +648,183 @@ def model_ECt(model: nn.Module, input_X: np.ndarray, target_Y: np.ndarray, pert_
         )
 
         # Average difference across M samples -> row for this perturbed node
-        NPI_ECt[:, node, :] = perturbed_output - unperturbed_output  # (M, N)
+        NPI_ECt[:, node, :] = perturbed_output - unperturbed_output  # (M, N, N)
 
     return NPI_ECt
 
 
+def state_distance(x, x_s, metric='l2'):
+    """
+    Compute distance or angle between two state vectors x and x_s.
+    Works for high-dimensional vectors.
+    """
+    x = np.ravel(x)
+    x_s = np.ravel(x_s)
+
+    if metric == 'l2':
+        return np.linalg.norm(x_s - x)
+
+    nx, nxs = np.linalg.norm(x), np.linalg.norm(x_s)
+    if nx == 0 or nxs == 0:
+        return np.nan
+
+    if metric == 'cosine_dist':
+        cos_sim = np.dot(x, x_s) / (nx * nxs)
+        cos_sim = np.clip(cos_sim, -1.0, 1.0)
+        return 1.0 - cos_sim
+
+    elif metric == 'angle':
+        cos_theta = np.dot(x, x_s) / (nx * nxs)
+        cos_theta = np.clip(cos_theta, -1.0, 1.0)
+        theta = np.arccos(cos_theta)          # radians, [0, π]
+        # map to [-π, π] (unsigned → signed mapping not meaningful in >3D, but safe)
+        if theta > np.pi:
+            theta -= 2 * np.pi
+        return theta
+
+    else:
+        raise ValueError("metric must be one of ['l2', 'cosine_dist', 'angle']")
 
 
 
 
 
+def model_BECt(model: nn.Module, input_X: np.ndarray, target_Y: np.ndarray, pert_strength: float, metric='angle') -> np.ndarray:
+    """
+    Infer an effective connectivity (EC)-like influence matrix via perturbation at each time point.
 
+    For each node j (column), add a small perturbation of size 'pert_strength' to the
+    last time step in the S-step input window (i.e., only at the most recent time),
+    feed both perturbed and unperturbed inputs through the model, and average the
+    output differences across samples. Row j of the returned matrix is the effect of
+    perturbing node j on all nodes.
 
+    Args:
+        model:        trained surrogate
+        input_X:      (M, S*N) input windows for M samples
+        target_Y:     (M, N)   (not used for loss here; used for N)
+        pert_strength: scalar perturbation magnitude
+        metric: scalar that evaluates the distance between perturbed and unperturbed states. It can be ['l2', 'cosine_dist', or 'angle']
 
+    Returns:
+        NPI_BECt: (M, N, N) where the element ij is effect of perturbing nodes i and j at all times (first axis)
+    """
+    node_num = target_Y.shape[1]           # N
+    steps = int(input_X.shape[1] / node_num)  # S from S*N
+    M=input_X.shape[0]
+
+    NPI_BECt = np.zeros((M, node_num, node_num), dtype=float)  # (N, N)
+
+    for node_i in range(node_num):
+        for node_j in range(node_num):
+            # Unperturbed outputs across all M samples: (M, N)
+            unperturbed_output = (
+                model(torch.tensor(input_X, dtype=torch.float, device=device)).detach().cpu().numpy()
+            )
     
-
-
-
+            # Build a perturbation that only hits the last step and a single node: (S, N)
+            perturbation = np.zeros((steps, node_num), dtype=float)
+            perturbation[-1, node_i] = pert_strength
+            perturbation[-1, node_j] = pert_strength
+            perturb_flat = perturbation.flatten()  # (S*N,)
     
+            # Perturbed outputs: (M, N)
+            perturbed_output = (
+                model(torch.tensor(input_X + perturb_flat, dtype=torch.float, device=device))
+                .detach()
+                .cpu()
+                .numpy()
+            )
+    
+            NPI_BECt[:, node_i, node_j] = np.asarray([state_distance(perturbed_output[i,:], unperturbed_output[i,:], metric=metric) for i in range(M)]) # (M, N, N)
 
-# def collect_state_effect_pairs(
-#     model: nn.Module,
-#     input_X: np.ndarray,
-#     target_Y: np.ndarray,
-#     pert_strength: float = 0.1,
-#     use_model_next: bool = True,
-# ):
-#     """
-#     Collect (x_t baseline, x_{t+Δt} next, x_{t+Δt}^{stim}) triplets for *every* time window
-#     and *every* stimulated region.
+    return NPI_BECt
 
-#     Args:
-#         model:          Trained surrogate (ANN_MLP / ANN_CNN / ANN_RNN / ANN_VAR).
-#         input_X:        (W, S*N) sliding-window inputs. Each row ends at time t.
-#         target_Y:       (W, N) targets (empirical next step at t+Δt). Used for shapes (and
-#                         can optionally serve as x_{t+Δt} if use_model_next=False).
-#         pert_strength:  Scalar amplitude of the stimulation applied to the *last* step
-#                         (time t) and a single region j.
-#         use_model_next: If True, x_{t+Δt} (unperturbed) comes from the model forward pass.
-#                         If False, it uses target_Y (empirical next step).
 
-#     Returns:
-#         result: dict with
-#             - 'xt_baseline':   (W, N) baseline states at time t (last step of each window)
-#             - 'xt_next':       (W, N) unperturbed next states at t+Δt
-#                                (model outputs if use_model_next=True, else target_Y)
-#             - 'xt_stim_next':  (N, W, N) for each stimulated region j:
-#                                   xt_stim_next[j, w, :] = model( window_w with stim at node j )
-#             - 'meta':          dict of helper info (N, S, W, pert_strength)
 
-#     Notes:
-#         Shapes:
-#             - W: number of windows (sliding windows extracted from data)
-#             - S: number of past steps per window
-#             - N: number of regions (nodes)
-#         Stimulation is injected at the *last* step of each window (time t).
-#     """
-#     model.eval()
+def collect_state_effect_pairs(
+    model: nn.Module,
+    input_X: np.ndarray,
+    target_Y: np.ndarray,
+    pert_strength: float = 0.1,
+    use_model_next: bool = True,
+):
+    """
+    Collect (x_t baseline, x_{t+Δt} next, x_{t+Δt}^{stim}) triplets for *every* time window
+    and *every* stimulated region.
 
-#     W = input_X.shape[0]
-#     N = target_Y.shape[1]
-#     S = input_X.shape[1] // N
+    Args:
+        model:          Trained surrogate (ANN_MLP / ANN_CNN / ANN_RNN / ANN_VAR).
+        input_X:        (W, S*N) sliding-window inputs. Each row ends at time t.
+        target_Y:       (W, N) targets (empirical next step at t+Δt). Used for shapes (and
+                        can optionally serve as x_{t+Δt} if use_model_next=False).
+        pert_strength:  Scalar amplitude of the stimulation applied to the *last* step
+                        (time t) and a single region j.
+        use_model_next: If True, x_{t+Δt} (unperturbed) comes from the model forward pass.
+                        If False, it uses target_Y (empirical next step).
 
-#     # ---- x_t baseline: last-step slice from each window ----
-#     xt_baseline = input_X.reshape(W, S, N)[:, -1, :].copy()  # (W, N)
+    Returns:
+        result: dict with
+            - 'xt_baseline':   (W, N) baseline states at time t (last step of each window)
+            - 'xt_next':       (W, N) unperturbed next states at t+Δt
+                               (model outputs if use_model_next=True, else target_Y)
+            - 'xt_stim_next':  (N, W, N) for each stimulated region j:
+                                  xt_stim_next[j, w, :] = model( window_w with stim at node j )
+            - 'meta':          dict of helper info (N, S, W, pert_strength)
 
-#     # ---- x_{t+Δt} unperturbed ----
-#     if use_model_next:
-#         with torch.no_grad():
-#             xt_next = (
-#                 model(torch.tensor(input_X, dtype=torch.float, device=device))
-#                 .detach()
-#                 .cpu()
-#                 .numpy()
-#             )  # (W, N)
-#     else:
-#         xt_next = np.asarray(target_Y, dtype=float)  # (W, N)
+    Notes:
+        Shapes:
+            - W: number of windows (sliding windows extracted from data)
+            - S: number of past steps per window
+            - N: number of regions (nodes)
+        Stimulation is injected at the *last* step of each window (time t).
+    """
+    model.eval()
 
-#     # ---- x_{t+Δt}^{stim} for each stimulated region j ----
-#     xt_stim_next = np.zeros((N, W, N), dtype=float)
+    W = input_X.shape[0]
+    N = target_Y.shape[1]
+    S = input_X.shape[1] // N
 
-#     for j in range(N):
-#         perturb = np.zeros((S, N), dtype=float)
-#         perturb[-1, j] = pert_strength
-#         perturb_flat = perturb.flatten()  # (S*N,)
+    # ---- x_t baseline: last-step slice from each window ----
+    xt_baseline = input_X.reshape(W, S, N)[:, -1, :].copy()  # (W, N)
 
-#         with torch.no_grad():
-#             stim_out = (
-#                 model(torch.tensor(input_X + perturb_flat, dtype=torch.float, device=device))
-#                 .detach()
-#                 .cpu()
-#                 .numpy()
-#             )  # (W, N)
+    # ---- x_{t+Δt} unperturbed ----
+    if use_model_next:
+        with torch.no_grad():
+            xt_next = (
+                model(torch.tensor(input_X, dtype=torch.float, device=device))
+                .detach()
+                .cpu()
+                .numpy()
+            )  # (W, N)
+    else:
+        xt_next = np.asarray(target_Y, dtype=float)  # (W, N)
 
-#         xt_stim_next[j] = stim_out
+    # ---- x_{t+Δt}^{stim} for each stimulated region j ----
+    xt_stim_next = np.zeros((N, W, N), dtype=float)
 
-#     result = {
-#         "xt_baseline": xt_baseline,     # (W, N)
-#         "xt_next": xt_next,             # (W, N)
-#         "xt_stim_next": xt_stim_next,   # (N, W, N)
-#         "meta": {"W": W, "S": S, "N": N, "pert_strength": pert_strength},
-#     }
-#     return result
+    for j in range(N):
+        perturb = np.zeros((S, N), dtype=float)
+        perturb[-1, j] = pert_strength
+        perturb_flat = perturb.flatten()  # (S*N,)
+
+        with torch.no_grad():
+            stim_out = (
+                model(torch.tensor(input_X + perturb_flat, dtype=torch.float, device=device))
+                .detach()
+                .cpu()
+                .numpy()
+            )  # (W, N)
+
+        xt_stim_next[j] = stim_out
+
+    result = {
+        "xt_baseline": xt_baseline,     # (W, N)
+        "xt_next": xt_next,             # (W, N)
+        "xt_stim_next": xt_stim_next,   # (N, W, N)
+        "meta": {"W": W, "S": S, "N": N, "pert_strength": pert_strength},
+    }
+    return result
 
 ########################################
 # # Simulated timeseries 
