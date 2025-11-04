@@ -354,6 +354,51 @@ def train_NN(
 
 
 # -----------------------------------------------------------------------------
+# Model builder utility
+# -----------------------------------------------------------------------------
+def build_model(method: str, ROI_num: int, using_steps: int):
+    """
+    Build and return an ANN model based on the selected architecture.
+
+    Args:
+        method:       'MLP', 'CNN', 'RNN', or 'VAR'
+        ROI_num:      number of brain regions (N)
+        using_steps:  number of time steps in each input window (S)
+    """
+    method = method.upper()
+    if method == "MLP":
+        return ANN_MLP(
+            input_dim=using_steps * ROI_num,
+            hidden_dim=2 * ROI_num,
+            latent_dim=int(0.8 * ROI_num),
+            output_dim=ROI_num,
+        )
+    elif method == "CNN":
+        return ANN_CNN(
+            in_channels=ROI_num,
+            hidden_channels=3 * ROI_num,
+            out_channels=ROI_num,
+            data_length=using_steps,
+        )
+    elif method == "RNN":
+        return ANN_RNN(
+            input_dim=ROI_num,
+            hidden_dim=int(2.5 * ROI_num),
+            latent_dim=int(2.5 * ROI_num),
+            output_dim=ROI_num,
+            data_length=using_steps,
+        )
+    elif method == "VAR":
+        return ANN_VAR(
+            input_dim=using_steps * ROI_num,
+            output_dim=ROI_num,
+        )
+    else:
+        raise ValueError(f"Unknown method '{method}'. Use 'MLP', 'CNN', 'RNN', or 'VAR'.")
+
+
+
+# -----------------------------------------------------------------------------
 # Connectivity helpers
 # -----------------------------------------------------------------------------
 def corrcoef(signals: np.ndarray) -> np.ndarray:
