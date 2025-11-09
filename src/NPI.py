@@ -769,8 +769,11 @@ def model_BECt(model: nn.Module, input_X: np.ndarray, target_Y: np.ndarray, pert
     
             # Build a perturbation that only hits the last step and a single node: (S, N)
             perturbation = np.zeros((steps, node_num), dtype=float)
-            perturbation[-1, node_i] = pert_strength
-            perturbation[-1, node_j] = pert_strength
+            if node_j == node_i:
+                perturbation[-1, node_i] = pert_strength
+            else:
+                perturbation[-1, node_i] = pert_strength/np.sqrt(2)
+                perturbation[-1, node_j] = pert_strength/np.sqrt(2)
             perturb_flat = perturbation.flatten()  # (S*N,)
     
             # Perturbed outputs: (M, N)
