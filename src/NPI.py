@@ -601,7 +601,7 @@ def model_time_series(model: nn.Module, initial_state, tlen:int, noise_strength:
 
     # Generate tlen predicted steps
     for _ in range(tlen):
-        noise = 0#noise_strength * np.random.randn(S * N)  # (S*N,)
+        noise = noise_strength * np.random.randn(S * N)  # (S*N,)
         model_input = np.array(NN_sim[-S:]).flatten() + noise  # (S*N,)
 
         if isinstance(model, ANN_RNN):
