@@ -649,24 +649,36 @@ def model_Jacobian_timewise(model: nn.Module, input_X: np.ndarray, steps: int) -
 
 
 def model_ECt(model: nn.Module, input_X: np.ndarray, target_Y: np.ndarray, pert_strength: float) -> np.ndarray:
-    """
-    Infer an effective connectivity (EC)-like influence matrix via perturbation at each time point.
+"""
+    Compute effective connectivity (EC)-like influence matrix via single-node perturbation at the last timestep.
 
-    For each node j (column), add a small perturbation of size 'pert_strength' to the
-    last time step in the S-step input window (i.e., only at the most recent time),
-    feed both perturbed and unperturbed inputs through the model, and average the
-    output differences across samples. Row j of the returned matrix is the effect of
-    perturbing node j on all nodes.
+    For each node j in the network, compute how stimulating that node at the final timestep affects
+    all nodes' outputs, repeated across M different initial conditions.
+
+    For each node j:
+      1. Get unperturbed model predictions for all M initial conditions
+      2. Create a perturbation (stimulation) affecting only node j at the final timestep
+      3. Get model predictions with stimulation applied to all M initial conditions
+      4. Record the difference in predictions (perturbed - unperturbed) for each initial condition
 
     Args:
-        model:        trained surrogate
-        input_X:      (M, S*N) input windows for M samples
-        target_Y:     (M, N)   (not used for loss here; used for N)
-        pert_strength: scalar perturbation magnitude
+        model:          trained surrogate neural network
+        input_X:        (M, S*N) array of M flattened input windows, where each row represents
+                        a different initial condition. S is the number of past timesteps and N is the
+                        number of nodes. Each input window contains S consecutive timesteps
+                        (e.g., [t, t-1, t-2, ...]) flattened from (S, N) to (S*N).
+                        The "final timestep" refers to the most recent state (t) in this window.
+        target_Y:       (M, N) array of target outputs (used only to extract N, the number of nodes)
+        pert_strength:  scalar magnitude of perturbation/stimulation to apply
 
     Returns:
-        NPI_ECt: (M, N, N) where the second axis index j is effect of perturbing node j on all nodes (third axis) at all times (first axis)
+        NPI_ECt: (M, N, N) array where NPI_ECt[i, j, :] is the output difference for initial
+                 condition i when node j is stimulated at the last timestep.
+                 The second axis j indexes which node was stimulated; the last axis indexes the
+                 resulting effect on all N nodes.
     """
+
+
     node_num = target_Y.shape[1]           # N
     steps = int(input_X.shape[1] / node_num)  # S from S*N
     M=input_X.shape[0]
