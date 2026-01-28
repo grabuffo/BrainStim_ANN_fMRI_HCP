@@ -649,7 +649,7 @@ def model_Jacobian_timewise(model: nn.Module, input_X: np.ndarray, steps: int) -
 
 
 def model_ECt(model: nn.Module, input_X: np.ndarray, target_Y: np.ndarray, pert_strength: float) -> np.ndarray:
-"""
+    """
     Compute effective connectivity (EC)-like influence matrix via single-node perturbation at the last timestep.
 
     For each node j in the network, compute how stimulating that node at the final timestep affects
